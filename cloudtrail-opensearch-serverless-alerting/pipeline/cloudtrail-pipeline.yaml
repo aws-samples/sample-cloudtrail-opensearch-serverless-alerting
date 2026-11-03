@@ -1,0 +1,31 @@
+version: "2"
+cloudtrail-log-pipeline:
+  source:
+    s3:
+      acknowledgments: true
+      notification_type: "sqs"
+      compression: gzip
+      codec:
+        json:
+      sqs:
+        queue_url: "https://sqs.us-east-1.amazonaws.com/<ACCOUNT_ID>/cloudtrail-log-queue"
+        maximum_messages: 10
+        visibility_timeout: "60s"
+        visibility_duplication_protection: true
+      aws:
+        region: "us-east-1"
+        sts_role_arn: "arn:aws:iam::<ACCOUNT_ID>:role/osi-cloudtrail-pipeline-role"
+  processor:
+    - date:
+        destination: "@timestamp"
+        from_time_received: true
+    - delete_entries:
+        with_keys: [ "s3" ]
+  sink:
+    - opensearch:
+        hosts: [ "https://<AOSS_COLLECTION_ID>.us-east-1.aoss.amazonaws.com" ]
+        index: "cloudtrail-logs"
+        aws:
+          sts_role_arn: "arn:aws:iam::<ACCOUNT_ID>:role/osi-cloudtrail-pipeline-role"
+          region: "us-east-1"
+          serverless: true
