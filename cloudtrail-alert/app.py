@@ -3,7 +3,6 @@
 Runs a PPL query against the collection, and publishes an Amazon SNS alert when it returns rows.
 Exit codes: 0 = success (alert sent or nothing found), 1 = query or publish failed.
 """
-import json
 import logging
 import os
 import sys

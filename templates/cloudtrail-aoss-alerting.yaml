@@ -10,8 +10,10 @@ Metadata:
         Parameters: [CloudTrailBucketName, CloudTrailPrefix]
       - Label: { default: "OpenSearch Serverless" }
         Parameters: [Generation, CollectionName, IndexName, RetentionDays, StandbyReplicas, AdminPrincipalArn]
+      - Label: { default: "Network" }
+        Parameters: [VpcCidr]
       - Label: { default: "Detection task" }
-        Parameters: [VpcId, VpcCidr, SubnetIds, AssignPublicIp, ContainerImageUri, ScheduleExpression, ScheduleState, AlertEmail]
+        Parameters: [ContainerImageUri, ImageTag, ScheduleExpression, ScheduleState, AlertEmail]
 
 Parameters:
   CloudTrailBucketName:
@@ -56,25 +58,24 @@ Parameters:
     Description: >-
       Optional IAM user or role ARN that gets read access to the collection for OpenSearch Dashboards and
       ad-hoc queries (for example, arn:aws:iam::123456789012:role/Admin). Without it, your own queries return 403.
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: VPC for the Fargate detection task.
   VpcCidr:
     Type: String
-    Default: 10.0.0.0/8
-    Description: CIDR block of the VPC, used to scope egress to VPC-routed endpoints only (e.g. 10.0.0.0/8).
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: Subnets for the Fargate task. Use public subnets (task gets a public IP) or private subnets with a NAT gateway.
-  AssignPublicIp:
-    Type: String
-    Default: ENABLED
-    AllowedValues: [ENABLED, DISABLED]
-    Description: ENABLED for public subnets. DISABLED for private subnets that route through a NAT gateway.
+    Default: 10.20.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+    Description: >-
+      CIDR for the VPC this stack creates (/16). It is split into two public subnets (NAT gateway) and two
+      private subnets (Fargate task and VPC endpoints).
   ContainerImageUri:
     Type: String
     Default: ""
-    Description: Detection image URI. Leave empty to use the ECR repository this stack creates (tag latest).
+    Description: Detection image URI. Leave empty to use the ECR repository this stack creates (tag ImageTag).
+  ImageTag:
+    Type: String
+    Default: "1.0.0"
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+    Description: >-
+      Tag of the detection image in the stack's ECR repository. Tags are immutable, so push each new
+      build under a new tag and update this parameter.
   ScheduleExpression:
     Type: String
     Default: rate(1 hour)
@@ -97,6 +98,195 @@ Conditions:
   DefaultPrefix: !Equals [!Ref CloudTrailPrefix, ""]
 
 Resources:
+  # ---------------------------------------------------------------------------
+  # Network: VPC with public subnets (NAT gateway) and private subnets (task + endpoints)
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: cloudtrail-alert }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: cloudtrail-alert }]
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{ Key: Name, Value: cloudtrail-alert-public-1 }]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{ Key: Name, Value: cloudtrail-alert-public-2 }]
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{ Key: Name, Value: cloudtrail-alert-private-1 }]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{ Key: Name, Value: cloudtrail-alert-private-2 }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: cloudtrail-alert-public }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # A single NAT gateway keeps cost down. For AZ-independent egress, add one per AZ.
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{ Key: Name, Value: cloudtrail-alert }]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: cloudtrail-alert-private }]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # VPC endpoints keep the task's AWS API traffic (OpenSearch Serverless, ECR, CloudWatch Logs,
+  # SNS, and S3 for ECR image layers) on the AWS network. The NAT gateway covers anything else.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from the detection task to the VPC endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref TaskSecurityGroup
+          Description: HTTPS from the detection task
+
+  AossVpcEndpoint:
+    Type: AWS::OpenSearchServerless::VpcEndpoint
+    Properties:
+      Name: !Sub "${CollectionName}-vpce"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref Vpc
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SnsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sns"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
   # ---------------------------------------------------------------------------
   # KMS key for CloudWatch Logs encryption
   # ---------------------------------------------------------------------------
@@ -134,14 +324,30 @@ Resources:
       Type: encryption
       Policy: !Sub '{"Rules":[{"ResourceType":"collection","Resource":["collection/${CollectionName}"]}],"AWSOwnedKey":true}'
 
+  # Private access only: the collection and Dashboards are reachable through the stack's
+  # OpenSearch Serverless VPC endpoint. The ingestion pipeline reaches the collection through
+  # its own VPC endpoint, which OpenSearch Ingestion adds to PipelineNetworkPolicy below.
   NetworkPolicy:
     Type: AWS::OpenSearchServerless::SecurityPolicy
     Properties:
       Name: !Sub "${CollectionName}-net"
       Type: network
-      # Public access for the reference deployment. For production, replace AllowFromPublic
-      # with "SourceVPCEs":["<vpce-id>"] using an OpenSearch Serverless VPC endpoint.
-      Policy: !Sub '[{"Rules":[{"ResourceType":"collection","Resource":["collection/${CollectionName}"]},{"ResourceType":"dashboard","Resource":["collection/${CollectionName}"]}],"AllowFromPublic":true}]'
+      Policy: !Sub '[{"Rules":[{"ResourceType":"collection","Resource":["collection/${CollectionName}"]},{"ResourceType":"dashboard","Resource":["collection/${CollectionName}"]}],"AllowFromPublic":false,"SourceVPCEs":["${AossVpcEndpoint}"]}]'
+
+  # Network policy named in the pipeline sink (serverless_options.network_policy_name). When the
+  # pipeline starts, OpenSearch Ingestion appends a rule admitting its own VPC endpoint. The stack
+  # creates the policy so it always exists: that lets the pipeline role's aoss:*SecurityPolicy
+  # permissions be scoped with the aoss:collection condition, which can't be evaluated for a
+  # policy that doesn't exist yet. The initial rule only repeats NetworkPolicy's access. Leave
+  # this resource's properties unchanged; a stack update that replaces the policy removes the
+  # pipeline's rule until the pipeline is restarted.
+  PipelineNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${CollectionName}-osi-net"
+      Type: network
+      Description: Network access for the OpenSearch Ingestion pipeline (rule added by the pipeline)
+      Policy: !Sub '[{"Description":"Stack endpoint (initial rule)","Rules":[{"ResourceType":"collection","Resource":["collection/${CollectionName}"]}],"AllowFromPublic":false,"SourceVPCEs":["${AossVpcEndpoint}"]}]'
 
   DataAccessPolicy:
     Type: AWS::OpenSearchServerless::AccessPolicy
@@ -151,11 +357,11 @@ Resources:
       Policy: !If
         - HasAdmin
         - !Sub
-          - '[{"Description":"OSI pipeline - write","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:CreateIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:WriteDocument"]}],"Principal":["${PipelineRoleArn}"]},{"Description":"Detection task - read-only","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:ReadDocument","aoss:DescribeIndex"]}],"Principal":["${TaskRoleArn}"]},{"Description":"Operator - read-only for Dashboards and ad-hoc queries","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:ReadDocument","aoss:DescribeIndex"]},{"ResourceType":"collection","Resource":["collection/${CollectionName}"],"Permission":["aoss:DescribeCollectionItems"]}],"Principal":["${AdminPrincipalArn}"]}]'
+          - '[{"Description":"OSI pipeline - write documents and manage the index template","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:CreateIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:WriteDocument"]},{"ResourceType":"collection","Resource":["collection/${CollectionName}"],"Permission":["aoss:CreateCollectionItems","aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"]}],"Principal":["${PipelineRoleArn}"]},{"Description":"Detection task - read-only","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:ReadDocument","aoss:DescribeIndex"]}],"Principal":["${TaskRoleArn}"]},{"Description":"Operator - read-only for Dashboards and ad-hoc queries","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:ReadDocument","aoss:DescribeIndex"]},{"ResourceType":"collection","Resource":["collection/${CollectionName}"],"Permission":["aoss:DescribeCollectionItems"]}],"Principal":["${AdminPrincipalArn}"]}]'
           - PipelineRoleArn: !GetAtt PipelineRole.Arn
             TaskRoleArn: !GetAtt TaskRole.Arn
         - !Sub
-          - '[{"Description":"OSI pipeline - write","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:CreateIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:WriteDocument"]}],"Principal":["${PipelineRoleArn}"]},{"Description":"Detection task - read-only","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:ReadDocument","aoss:DescribeIndex"]}],"Principal":["${TaskRoleArn}"]}]'
+          - '[{"Description":"OSI pipeline - write documents and manage the index template","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:CreateIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:WriteDocument"]},{"ResourceType":"collection","Resource":["collection/${CollectionName}"],"Permission":["aoss:CreateCollectionItems","aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"]}],"Principal":["${PipelineRoleArn}"]},{"Description":"Detection task - read-only","Rules":[{"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:ReadDocument","aoss:DescribeIndex"]}],"Principal":["${TaskRoleArn}"]}]'
           - PipelineRoleArn: !GetAtt PipelineRole.Arn
             TaskRoleArn: !GetAtt TaskRole.Arn
 
@@ -194,12 +400,36 @@ Resources:
   # ---------------------------------------------------------------------------
   # Ingestion: SQS queue + OpenSearch Ingestion pipeline
   # ---------------------------------------------------------------------------
+  # Customer managed key for the queues. The AWS managed key (alias/aws/sqs) can't be used: its key
+  # policy can't grant S3 the kms:GenerateDataKey it needs to send event notifications.
+  QueueKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for the CloudTrail ingest queue and its dead-letter queue
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RootAccess
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: S3EventNotifications
+            Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: [kms:GenerateDataKey, kms:Decrypt]
+            Resource: "*"
+            Condition:
+              ArnEquals: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:s3:::${CloudTrailBucketName}" }
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
   IngestDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: cloudtrail-log-queue-dlq
       MessageRetentionPeriod: 1209600
-      KmsMasterKeyId: alias/aws/sqs
+      KmsMasterKeyId: !Ref QueueKmsKey
 
   IngestQueue:
     Type: AWS::SQS::Queue
@@ -207,7 +437,7 @@ Resources:
       QueueName: cloudtrail-log-queue
       VisibilityTimeout: 60
       MessageRetentionPeriod: 345600
-      KmsMasterKeyId: alias/aws/sqs
+      KmsMasterKeyId: !Ref QueueKmsKey
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt IngestDeadLetterQueue.Arn
         maxReceiveCount: 5
@@ -244,10 +474,121 @@ Resources:
           - Effect: Allow
             Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility]
             Resource: !GetAtt IngestQueue.Arn
+          # The queue is encrypted with QueueKmsKey; receiving messages requires kms:Decrypt.
+          - Effect: Allow
+            Action: kms:Decrypt
+            Resource: !GetAtt QueueKmsKey.Arn
+          # aoss:APIAccessAll is the only IAM action for the OpenSearch Serverless data plane.
+          # Per-operation permissions (write documents, manage the index) are granted in
+          # DataAccessPolicy, which is where the service enforces them. BatchGetCollection lets the
+          # sink look up the collection endpoint; it is called by collection ID, so it is scoped
+          # by the collection ARN rather than the aoss:collection (name) condition.
           - Effect: Allow
             Action: [aoss:BatchGetCollection, aoss:APIAccessAll]
             Resource: !GetAtt Collection.Arn
+          # OpenSearch Ingestion reads PipelineNetworkPolicy and adds its VPC endpoint to it. The
+          # stack creates that policy, so the pipeline doesn't need aoss:CreateSecurityPolicy.
+          # These actions don't support resource ARNs, so Resource must be "*"; the
+          # aoss:collection condition limits them to policies that cover this collection.
+          - Effect: Allow
+            Action: [aoss:GetSecurityPolicy, aoss:UpdateSecurityPolicy]
+            Resource: "*"
+            Condition:
+              StringEquals: { "aoss:collection": !Ref CollectionName }
             # If your CloudTrail bucket uses SSE-KMS, also grant kms:Decrypt on that key.
+          - Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub "${PipelineDlqBucket.Arn}/opensearch-sink-dlq/*"
+
+  # Private bucket for documents the collection rejects. Retained on stack deletion so failed
+  # CloudTrail records are never deleted with the stack.
+  PipelineDlqBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: pipeline-dlq/
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+
+  PipelineDlqBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PipelineDlqBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt PipelineDlqBucket.Arn, !Sub "${PipelineDlqBucket.Arn}/*"]
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  # Server access logs for PipelineDlqBucket. Retained on stack deletion with the bucket it audits.
+  # Server access logging requires SSE-S3 on the destination bucket.
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: This is the access log destination; logging it to itself would loop.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ServerAccessLogs
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogsBucket.Arn}/pipeline-dlq/*"
+            Condition:
+              ArnLike: { "aws:SourceArn": !GetAtt PipelineDlqBucket.Arn }
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt AccessLogsBucket.Arn, !Sub "${AccessLogsBucket.Arn}/*"]
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
 
   PipelineRole:
     Type: AWS::IAM::Role
@@ -273,7 +614,7 @@ Resources:
 
   IngestionPipeline:
     Type: AWS::OSIS::Pipeline
-    DependsOn: [DataAccessPolicy, IngestQueuePolicy]
+    DependsOn: [DataAccessPolicy, IngestQueuePolicy, PipelineNetworkPolicy]
     Properties:
       PipelineName: cloudtrail-pipeline
       MinUnits: 1
@@ -306,14 +647,42 @@ Resources:
                 from_time_received: true
             - delete_entries:
                 with_keys: [ "s3" ]
+            # These CloudTrail fields have a different shape for every API call. Indexed as
+            # objects, they exceed the index's total-field limit and cause mapping conflicts, which
+            # reject documents. Store them as JSON strings instead.
+            - write_json:
+                source: "requestParameters"
+            - write_json:
+                source: "responseElements"
+            - write_json:
+                source: "additionalEventData"
+            - write_json:
+                source: "serviceEventDetails"
           sink:
             - opensearch:
                 hosts: [ "${Collection.CollectionEndpoint}" ]
                 index: "${IndexName}"
+                # Explicit date fields and no date detection: otherwise the first date-like value
+                # of a string field (for example apiVersion "2016-11-15") maps it as a date and
+                # later values such as "2020_05_31" are rejected.
+                template_type: "index-template"
+                template_content: >-
+                  {"template":{"mappings":{"date_detection":false,"properties":{
+                  "@timestamp":{"type":"date"},"eventTime":{"type":"date"}}}}}
                 aws:
                   sts_role_arn: "${PipelineRole.Arn}"
                   region: "${AWS::Region}"
                   serverless: true
+                  serverless_options:
+                    network_policy_name: "${CollectionName}-osi-net"
+                # Documents OpenSearch rejects go here. The S3 object is then acknowledged, so SQS
+                # doesn't redeliver it and re-index its other records as duplicates.
+                dlq:
+                  s3:
+                    bucket: "${PipelineDlqBucket}"
+                    key_path_prefix: "opensearch-sink-dlq/"
+                    region: "${AWS::Region}"
+                    sts_role_arn: "${PipelineRole.Arn}"
 
   # ---------------------------------------------------------------------------
   # Alerting: SNS
@@ -340,6 +709,9 @@ Resources:
     Properties:
       RepositoryName: cloudtrail-alert
       ImageScanningConfiguration: { ScanOnPush: true }
+      # Tags can't be overwritten, so the task definition (ImageTag) always runs the image that was
+      # pushed under that tag. Push each new build under a new tag.
+      ImageTagMutability: IMMUTABLE
       EmptyOnDelete: true
       EncryptionConfiguration:
         EncryptionType: KMS
@@ -348,6 +720,9 @@ Resources:
     Type: AWS::ECS::Cluster
     Properties:
       ClusterName: cloudtrail-alert
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
 
   TaskLogGroup:
     Type: AWS::Logs::LogGroup
@@ -376,8 +751,10 @@ Resources:
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          # Required for any OpenSearch Serverless data-plane call. Read-only access is
-          # enforced by the data access policy (ReadDocument + DescribeIndex).
+          # aoss:APIAccessAll is the only IAM action for the OpenSearch Serverless data plane, and
+          # it is scoped to this collection. Read-only access (ReadDocument, DescribeIndex) is
+          # enforced by DataAccessPolicy, which is where the service evaluates per-operation
+          # permissions.
           - Effect: Allow
             Action: aoss:APIAccessAll
             Resource: !GetAtt Collection.Arn
@@ -402,13 +779,15 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Outbound-only access for the CloudTrail detection task
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
+      # No ingress. HTTPS egress reaches the VPC endpoints (private IPs), the S3 gateway endpoint
+      # (S3 public IP ranges), and the NAT gateway for anything without an endpoint.
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: !Ref VpcCidr
-          Description: HTTPS to OpenSearch Serverless, SNS, ECR, and CloudWatch Logs
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to VPC endpoints, S3 gateway endpoint, and NAT gateway
 
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -427,7 +806,7 @@ Resources:
         - Name: cloudtrail-alert
           Image: !If
             - UseStackRepo
-            - !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${Repository}:latest"
+            - !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${Repository}:${ImageTag}"
             - !Ref ContainerImageUri
           Essential: true
           Environment:
@@ -457,6 +836,8 @@ Resources:
           - Effect: Allow
             Action: iam:PassRole
             Resource: [!GetAtt TaskRole.Arn, !GetAtt TaskExecutionRole.Arn]
+            Condition:
+              StringEquals: { "iam:PassedToService": ecs-tasks.amazonaws.com }
 
   EventsRole:
     Type: AWS::IAM::Role
@@ -489,11 +870,18 @@ Resources:
             PlatformVersion: LATEST
             NetworkConfiguration:
               AwsVpcConfiguration:
-                Subnets: !Ref SubnetIds
+                Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
                 SecurityGroups: [!Ref TaskSecurityGroup]
-                AssignPublicIp: !Ref AssignPublicIp
+                AssignPublicIp: DISABLED
 
 Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  PrivateSubnetIds:
+    Description: Subnets the detection task runs in
+    Value: !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+  TaskSecurityGroupId:
+    Value: !Ref TaskSecurityGroup
   CollectionEndpoint:
     Value: !GetAtt Collection.CollectionEndpoint
   DashboardsEndpoint:
@@ -501,6 +889,9 @@ Outputs:
   DeadLetterQueueUrl:
     Description: Messages land here after 5 failed processing attempts; alarm on its depth
     Value: !Ref IngestDeadLetterQueue
+  PipelineDlqBucketName:
+    Description: Documents rejected by the collection are written under opensearch-sink-dlq/
+    Value: !Ref PipelineDlqBucket
   Generation:
     Value: !Ref Generation
   IngestQueueArn:
