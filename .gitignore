@@ -1,0 +1,9 @@
+# Local deployment values (see .env.example)
+.env
+
+# Local scan output and tool state
+.protoshield/
+.holmes/
+.kiro/
+.ruff_cache/
+__pycache__/

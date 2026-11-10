@@ -21,11 +21,39 @@ cloudtrail-log-pipeline:
         from_time_received: true
     - delete_entries:
         with_keys: [ "s3" ]
+    # These CloudTrail fields have a different shape for every API call. Indexed as objects, they
+    # exceed the index's total-field limit and cause mapping conflicts. Store them as JSON strings.
+    - write_json:
+        source: "requestParameters"
+    - write_json:
+        source: "responseElements"
+    - write_json:
+        source: "additionalEventData"
+    - write_json:
+        source: "serviceEventDetails"
   sink:
     - opensearch:
         hosts: [ "https://<AOSS_COLLECTION_ID>.us-east-1.aoss.amazonaws.com" ]
         index: "cloudtrail-logs"
+        # Explicit date fields and no date detection, so string fields such as apiVersion
+        # aren't mapped as dates by their first value.
+        template_type: "index-template"
+        template_content: >-
+          {"template":{"mappings":{"date_detection":false,"properties":{
+          "@timestamp":{"type":"date"},"eventTime":{"type":"date"}}}}}
         aws:
           sts_role_arn: "arn:aws:iam::<ACCOUNT_ID>:role/osi-cloudtrail-pipeline-role"
           region: "us-east-1"
           serverless: true
+          # The collection is VPC-only. OpenSearch Ingestion creates this network policy and adds
+          # the VPC endpoint it uses to reach the collection.
+          serverless_options:
+            network_policy_name: "cloudtrail-logs-osi-net"
+        # Rejected documents go here, so SQS doesn't redeliver the whole log file and duplicate
+        # its other records.
+        dlq:
+          s3:
+            bucket: "<PIPELINE_DLQ_BUCKET>"
+            key_path_prefix: "opensearch-sink-dlq/"
+            region: "us-east-1"
+            sts_role_arn: "arn:aws:iam::<ACCOUNT_ID>:role/osi-cloudtrail-pipeline-role"
